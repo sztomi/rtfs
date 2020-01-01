@@ -1,7 +1,7 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::Path;
 use std::sync::Mutex;
-use std::ffi::{CStr, CString, OsStr, OsString};
 
 use anyhow;
 use fuse_mt::*;
@@ -9,18 +9,20 @@ use libc;
 use rand::Rng;
 use time::*;
 
+use crate::artifactory::Listing::{Directory, Error, File};
 use crate::artifactory::{Artifactory, Listing};
-use crate::artifactory::Listing::{File, Directory, Error};
 
 const TTL: Timespec = Timespec { sec: 10, nsec: 0 };
 const ENOTDIR: libc::c_int = 20;
+const EISDIR: libc::c_int = 21;
 
 pub struct RtFS {
   pub rt: Box<Artifactory>,
   pub repo: String,
   _dir_handles: Mutex<HashMap<u64, String>>,
+  _file_handles: Mutex<HashMap<u64, String>>,
   _last_dir_handle: Mutex<u64>,
-  _last_file_handle: u64,
+  _last_file_handle: Mutex<u64>,
 }
 
 fn timestamp_to_timespec(timestamp: &String) -> anyhow::Result<Timespec> {
@@ -36,8 +38,10 @@ impl RtFS {
       rt: rt,
       repo: repo,
       _dir_handles: Mutex::new(HashMap::new()),
-      _last_dir_handle: Mutex::new(rng.gen()),
-      _last_file_handle: rng.gen(),
+      _file_handles: Mutex::new(HashMap::new()),
+      // totally arbitrary range, I just don't want it too high or too low.
+      _last_dir_handle: Mutex::new(rng.gen_range(0xaaaa, std::u64::MAX / 2)),
+      _last_file_handle: Mutex::new(rng.gen_range(0xaaaa, std::u64::MAX / 2)),
     }
   }
 
@@ -55,7 +59,7 @@ impl RtFS {
     let listing_result = self.rt.storage(&path);
     let listing = match listing_result {
       Ok(lst) => lst,
-      Err(e) => panic!(format!("{:?}", e))
+      Err(e) => panic!(format!("{:?}", e)),
     };
     let kind = match listing {
       Listing::File(_) => FileType::RegularFile,
@@ -112,6 +116,23 @@ impl RtFS {
     );
     *dh
   }
+
+  fn get_file_handle(&self, path: &Path) -> u64 {
+    let mut fh = self
+      ._last_file_handle
+      .lock()
+      .expect("could not lock _last_file_handle");
+    *fh += 1;
+    let mut fh_registry = self
+      ._file_handles
+      .lock()
+      .expect("Could not lock _file_handles");
+    fh_registry.insert(
+      *fh,
+      path.to_str().expect("Could not convert path").to_string(),
+    );
+    *fh
+  }
 }
 
 impl FilesystemMT for RtFS {
@@ -164,24 +185,76 @@ impl FilesystemMT for RtFS {
       return Err(libc::EINVAL);
     }
 
-    let path_str = format!("{}/{}", self.repo, String::from(path.to_str().unwrap_or("/")));
+    let path_str = format!(
+      "{}/{}",
+      self.repo,
+      String::from(path.to_str().unwrap_or("/"))
+    );
     let listing = match self.rt.storage(&path_str) {
       Ok(lst) => lst,
-      Err(_) => return Ok(entries)
+      Err(_) => return Ok(entries),
     };
 
     let listing = match &listing {
       File(_) => panic!("readdir called for non-directory entry"),
       Error(_) => return Ok(entries),
-      Directory(d) => d
+      Directory(d) => d,
     };
 
     for item in &listing.children {
       entries.push(DirectoryEntry {
         name: OsString::from(item.get_name()),
-        kind: if item.folder { FileType::Directory } else { FileType::RegularFile }
+        kind: if item.folder {
+          FileType::Directory
+        } else {
+          FileType::RegularFile
+        },
       });
     }
     Ok(entries)
+  }
+
+  fn open(&self, _req: RequestInfo, path: &Path, flags: u32) -> ResultOpen {
+    debug!("open: {:?} flags={:#x}", path, flags);
+    let (_, attr) = self.getattr(_req, path, None)?;
+    match attr.kind {
+      FileType::RegularFile => {
+        let fh = self.get_file_handle(&path);
+        Ok((fh, 0))
+      }
+      _ => Err(EISDIR),
+    }
+  }
+
+  fn release(
+    &self,
+    _req: RequestInfo,
+    path: &Path,
+    fh: u64,
+    _flags: u32,
+    _lock_owner: u64,
+    _flush: bool,
+  ) -> ResultEmpty {
+    debug!("release: {:?}", path);
+    let mut fh_registry = self
+      ._file_handles
+      .lock()
+      .expect("Could not lock _dir_handles");
+    if fh_registry.contains_key(&fh) {
+      fh_registry.remove(&fh);
+    }
+    Ok(())
+  }
+
+  fn read(
+    &self,
+    _req: RequestInfo,
+    path: &Path,
+    fh: u64,
+    offset: u64,
+    size: u32,
+    result: impl FnOnce(Result<&[u8], libc::c_int>),
+  ) {
+    unimplemented!()
   }
 }
