@@ -1,0 +1,22 @@
+[package]
+name = "rtfs"
+version = "0.1.0"
+authors = ["Tamás Szelei <szelei.t@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+reqwest = "*"
+dotenv = "*"
+envy = "*"
+serde = "*"
+serde_derive = "*"
+serde_json = "*"
+base64 = "*"
+fuse_mt = "*"
+time = "*"
+log = "0.4"
+anyhow = "1.0"
+rand = "*"
+libc = "*"
