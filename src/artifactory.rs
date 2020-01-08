@@ -114,14 +114,30 @@ impl Artifactory {
     Ok(listing)
   }
 
+  pub fn read_file(&self, uri: &String, offset: u64, size: u32, buf: &mut Vec<u8>) -> reqwest::Result<reqwest::Response> {
+    let mut resp = self
+      ._client
+      .get(uri)
+      .header("Authorization", &self._auth)
+      .header("Range", format!("bytes={}-{}", offset, offset+(size as u64)))
+      .send()?;
+    resp.copy_to(buf).expect("could not copy file data to buffer");
+    Ok(resp)
+  }
+
   fn _api(&self, endpoint: &str) -> reqwest::Result<reqwest::Response> {
     let url = format!("{}/api/{}", self.host, endpoint);
+    self._get(&url)
+  }
+
+  fn _get(&self, url: &str) -> reqwest::Result<reqwest::Response> {
     self
       ._client
-      .get(&url)
+      .get(url)
       .header("Authorization", &self._auth)
       .send()
   }
+
 }
 
 impl DirEntry {
