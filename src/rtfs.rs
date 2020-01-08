@@ -16,13 +16,20 @@ const TTL: Timespec = Timespec { sec: 10, nsec: 0 };
 const ENOTDIR: libc::c_int = 20;
 const EISDIR: libc::c_int = 21;
 
+#[derive(Clone)]
+struct FsInfo {
+  attr: FileAttr,
+  path: String,
+}
+
 pub struct RtFS {
   pub rt: Box<Artifactory>,
   pub repo: String,
-  _dir_handles: Mutex<HashMap<u64, String>>,
-  _file_handles: Mutex<HashMap<u64, String>>,
+  _dir_handles: Mutex<HashMap<u64, FsInfo>>,
+  _file_handles: Mutex<HashMap<u64, FsInfo>>,
   _last_dir_handle: Mutex<u64>,
   _last_file_handle: Mutex<u64>,
+  _uris: Mutex<HashMap<String, String>>,
 }
 
 fn timestamp_to_timespec(timestamp: &String) -> anyhow::Result<Timespec> {
@@ -39,13 +46,14 @@ impl RtFS {
       repo: repo,
       _dir_handles: Mutex::new(HashMap::new()),
       _file_handles: Mutex::new(HashMap::new()),
+      _uris: Mutex::new(HashMap::new()),
       // totally arbitrary range, I just don't want it too high or too low.
       _last_dir_handle: Mutex::new(rng.gen_range(0xaaaa, std::u64::MAX / 2)),
       _last_file_handle: Mutex::new(rng.gen_range(0xaaaa, std::u64::MAX / 2)),
     }
   }
 
-  fn stat_for_path(&self, path: &String) -> anyhow::Result<FileAttr> {
+  fn stat_for_path(&self, path: &String, req: &RequestInfo) -> anyhow::Result<FileAttr> {
     let path = String::from(match path.as_str() {
       "/" => "",
       _ => path,
@@ -66,7 +74,14 @@ impl RtFS {
       Listing::Directory(_) => FileType::Directory,
       _ => FileType::Directory,
     };
-    let perm = 0o0440;
+
+    let mut _uri_registry = self._uris.lock().expect("could not lock _uris");
+    if let Listing::File(f) = &listing {
+      let path = path.trim_start_matches(&self.repo);
+      _uri_registry.insert(path.to_string(), f.uri.clone());
+    }
+
+    let perm = 0o0666;
 
     Ok(FileAttr {
       size: match &listing {
@@ -93,14 +108,14 @@ impl RtFS {
       kind,
       perm,
       nlink: 1,
-      uid: 0,
-      gid: 0,
+      uid: req.uid,
+      gid: req.gid,
       rdev: 0,
       flags: 0,
     })
   }
 
-  fn get_dir_handle(&self, path: &Path) -> u64 {
+  fn get_dir_handle(&self, fs_info: &FsInfo) -> u64 {
     let mut dh = self
       ._last_dir_handle
       .lock()
@@ -110,14 +125,11 @@ impl RtFS {
       ._dir_handles
       .lock()
       .expect("Could not lock _dir_handles");
-    dh_registry.insert(
-      *dh,
-      path.to_str().expect("Could not convert path").to_string(),
-    );
+    dh_registry.insert(*dh, fs_info.clone());
     *dh
   }
 
-  fn get_file_handle(&self, path: &Path) -> u64 {
+  fn get_file_handle(&self, fs_info: &FsInfo) -> u64 {
     let mut fh = self
       ._last_file_handle
       .lock()
@@ -127,10 +139,7 @@ impl RtFS {
       ._file_handles
       .lock()
       .expect("Could not lock _file_handles");
-    fh_registry.insert(
-      *fh,
-      path.to_str().expect("Could not convert path").to_string(),
-    );
+    fh_registry.insert(*fh, fs_info.clone());
     *fh
   }
 }
@@ -145,10 +154,10 @@ impl FilesystemMT for RtFS {
     debug!("destroy");
   }
 
-  fn getattr(&self, _req: RequestInfo, path: &Path, _fh: Option<u64>) -> ResultEntry {
+  fn getattr(&self, req: RequestInfo, path: &Path, _fh: Option<u64>) -> ResultEntry {
     debug!("getattr: {:?}", path);
     let path_str = String::from(path.to_str().unwrap_or("/"));
-    let attr = self.stat_for_path(&path_str).expect("boo");
+    let attr = self.stat_for_path(&path_str, &req).expect("boo");
     Ok((TTL, attr))
   }
 
@@ -157,7 +166,11 @@ impl FilesystemMT for RtFS {
     let (_, attr) = self.getattr(_req, path, None)?;
     match attr.kind {
       FileType::Directory => {
-        let fh = self.get_dir_handle(&path);
+        let fs_info = FsInfo {
+          path: path.to_string_lossy().to_string(),
+          attr: attr,
+        };
+        let fh = self.get_dir_handle(&fs_info);
         Ok((fh, 0))
       }
       _ => Err(ENOTDIR),
@@ -219,7 +232,11 @@ impl FilesystemMT for RtFS {
     let (_, attr) = self.getattr(_req, path, None)?;
     match attr.kind {
       FileType::RegularFile => {
-        let fh = self.get_file_handle(&path);
+        let fs_info = FsInfo {
+          path: path.to_string_lossy().to_string(),
+          attr: attr,
+        };
+        let fh = self.get_file_handle(&fs_info);
         Ok((fh, 0))
       }
       _ => Err(EISDIR),
@@ -250,11 +267,28 @@ impl FilesystemMT for RtFS {
     &self,
     _req: RequestInfo,
     path: &Path,
-    fh: u64,
+    _fh: u64,
     offset: u64,
     size: u32,
     result: impl FnOnce(Result<&[u8], libc::c_int>),
   ) {
-    unimplemented!()
+    debug!("read: {:?} {:#x} @ {:#x}", path, size, offset);
+    let mut data = Vec::<u8>::with_capacity(size as usize);
+    unsafe { data.set_len(size as usize) };
+
+    let _uri_registry = self._uris.lock().expect("could not lock _uris");
+    let path_str = path.to_str().expect("could not convert path to str");
+    match _uri_registry.get(path_str) {
+      Some(uri) => {
+        debug!("uri for file: {}", uri);
+        self.rt.read_file(&uri, offset, size, &mut data).expect("could not read file");
+      },
+      None => {
+        println!("{:?}", _uri_registry);
+        panic!("at the disco");
+      }
+    }
+
+    result(Ok(&data));
   }
 }
